@@ -1,0 +1,117 @@
+// ==UserScript==
+// @name         CW Game: Hit Sound
+// @namespace    https://cw-game.ru/
+// @version      2.2
+// @description  Звук на удары
+// @author       Gwenary
+// @match        https://playtest.cw-game.ru/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const config = {
+        hitSoundUrl: 'https://orangefreesounds.com/wp-content/uploads/2025/12/Gentle-little-bell-ringing-sound-effect.mp3',
+        hitVolume: 0.55,
+        checkInterval: 150,
+    };
+
+    let myCat = null;
+    let previousHpValue = null;
+    let audioHit;
+    let canPlaySound = false;
+
+    function log(...args) {
+        console.log('%c[CW Mod 2.2]', 'color: #9c27b0; font-weight: bold', ...args);
+    }
+
+    function initAudio() {
+        audioHit = new Audio(config.hitSoundUrl);
+        audioHit.volume = config.hitVolume;
+
+        const unlock = () => {
+            canPlaySound = true;
+            log('🔓 Звук разблокирован');
+        };
+        document.addEventListener('click', unlock, { once: true });
+        document.addEventListener('touchstart', unlock, { once: true });
+    }
+
+    function playSound(audio) {
+        if (!canPlaySound || !audio) return;
+        try {
+            audio.currentTime = 0;
+            audio.play().catch(() => {});
+        } catch (e) {}
+    }
+
+    function showHitNotification(damage) {
+        const notif = document.createElement('div');
+        notif.style.cssText = `
+            position: fixed; top: 25px; right: 25px; z-index: 99999999;
+            background: linear-gradient(135deg, #f44336, #c62828); color: white;
+            padding: 11px 20px; border-radius: 8px; font-size: 17px; font-weight: bold;
+            box-shadow: 0 5px 18px rgba(244, 67, 54, 0.6); border: 2px solid #fff;
+        `;
+        notif.innerHTML = `💥 БЬЮТ! <span style="font-size:15px;">-${damage} HP</span>`;
+        document.body.appendChild(notif);
+        setTimeout(() => notif.remove(), 2000);
+    }
+
+    function getHpValue(cat) {
+        if (!cat) return null;
+        const candidates = [cat.hp, cat.health, cat.hitPoints, cat.HP, cat.currentHp, cat.value];
+        for (let val of candidates) {
+            if (val !== undefined && val !== null) {
+                const num = Number(val);
+                if (!isNaN(num)) return num;
+                if (typeof val === 'object' && val.value !== undefined) return Number(val.value);
+            }
+        }
+        return null;
+    }
+
+    function checkHit(currentCat) {
+        const currentHp = getHpValue(currentCat);
+        if (currentHp === null) return;
+
+        if (previousHpValue !== null && currentHp < previousHpValue) {
+            const damage = Math.round(previousHpValue - currentHp);
+            log(`💥 Удар! Урон: -${damage}`);
+
+            playSound(audioHit);
+            showHitNotification(damage);
+        }
+        previousHpValue = currentHp;
+    }
+
+    function mainLoop() {
+        try {
+            const pg = window.CWGPlayground;
+            if (!pg) return;
+            myCat = pg.me?.() || pg.getMe?.();
+            if (!myCat) return;
+
+            checkHit(myCat);
+        } catch (e) {}
+    }
+
+    function start() {
+        log('🚀 Скрипт 2.2 запущен');
+        initAudio();
+
+        setInterval(() => {
+            if (window.CWGPlayground) mainLoop();
+        }, config.checkInterval);
+
+        setTimeout(mainLoop, 800);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+})();
