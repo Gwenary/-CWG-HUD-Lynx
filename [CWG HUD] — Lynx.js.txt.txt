@@ -1,0 +1,1066 @@
+// ==UserScript==
+// @name         [CWG HUD] — Lynx
+// @namespace    https://cw-game.ru/
+// @version      3.1
+// @description  Время, HP, КД удара, подсветка мобов, имена игроков, навыки, настройки
+// @author       Gwenary
+// @license      CC BY-NC 4.0
+// @match        https://playtest.cw-game.ru/*
+// @grant        none
+// @run-at       document-start
+// @downloadURL https://update.greasyfork.org/scripts/583561/%5BCWG%20HUD%5D%20%E2%80%94%20Lynx.user.js
+// @updateURL https://update.greasyfork.org/scripts/583561/%5BCWG%20HUD%5D%20%E2%80%94%20Lynx.meta.js
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    // === Настройки ===
+    const SETTINGS_KEY = 'cw-hud-settings';
+
+    const DEFAULT_SETTINGS = {
+        highlightMobs: true,
+        showCatNames: true,
+        playSpawnSound: true,
+        showSpawnBanner: true,
+        showHitBanner: true,
+        showCdBar: true,
+        showSkillsPanel: true,
+        showClock: true,
+        showHpBar: true,
+        mobColors: {
+            mouse:     '#ffdc50',
+            butterfly: '#ffdc50',
+            fox:       '#ffdc50',
+        },
+        mobSoundUrls: {
+            mouse:     '',
+            butterfly: '',
+            fox:       '',
+        },
+    };
+
+    function loadSettings() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+            return {
+                ...DEFAULT_SETTINGS,
+                ...saved,
+                mobColors:    { ...DEFAULT_SETTINGS.mobColors,    ...(saved.mobColors    || {}) },
+                mobSoundUrls: { ...DEFAULT_SETTINGS.mobSoundUrls, ...(saved.mobSoundUrls || {}) },
+            };
+        } catch(e) { return { ...DEFAULT_SETTINGS }; }
+    }
+
+    function saveSettings() {
+        try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(CFG)); } catch(e) {}
+    }
+
+    let CFG = loadSettings();
+
+    const getHighlightMobs    = () => CFG.highlightMobs;
+    const getPlaySpawnSound   = () => CFG.playSpawnSound;
+    const getShowSpawnBanner  = () => CFG.showSpawnBanner;
+    const getShowCatNames     = () => CFG.showCatNames;
+
+    const MOB_LABELS = new Set(['Мышь', 'Mouse', 'Бабочка', 'Butterfly', 'Лиса', 'Fox']);
+
+    const MOB_TYPES = {
+        mouse: '🐭 Мышь',
+        butterfly: '🦋 Бабочка',
+        fox: '🦊 Лиса',
+    };
+
+    const BUTTON_SELECTORS = [
+        '[aria-label="toggle action mode"]',
+        '[aria-label="Ударить"]',
+        '[aria-label="attack"]',
+    ];
+
+    const recentAlerts = new Map();
+
+    // === WebSocket ===
+    const OriginalWebSocket = window.WebSocket;
+    window.WebSocket = function(...args) {
+        const ws = new OriginalWebSocket(...args);
+        ws.addEventListener('message', (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (!data || typeof data !== 'object') return;
+
+                if (data.code === 1000 && data.payload) {
+                    handlePayload(data.payload);
+                }
+                if (data.code === 2001) {
+                    handleNewEntities(data);
+                }
+            } catch(e) {}
+        });
+        return ws;
+    };
+    window.WebSocket.prototype = OriginalWebSocket.prototype;
+
+    // === Аудио ===
+    let audioCtx = null;
+    function playSpawnSound(mobType) {
+        if (!getPlaySpawnSound()) return;
+        const customUrl = CFG?.mobSoundUrls?.[mobType];
+        if (customUrl) {
+            const audio = new Audio(customUrl);
+            audio.volume = 0.3;
+            audio.play().catch(() => playDefaultSpawnSound(mobType));
+            return;
+        }
+        playDefaultSpawnSound(mobType);
+    }
+
+    function playDefaultSpawnSound(mobType) {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain); gain.connect(audioCtx.destination);
+
+        if (mobType === 'mouse') {
+            // 🐭 Мышь — быстрый писк, высокая частота
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(900, audioCtx.currentTime);
+            osc.frequency.linearRampToValueAtTime(1400, audioCtx.currentTime + 0.15);
+        } else if (mobType === 'butterfly') {
+            // 🦋 Бабочка — мягкий порхающий, нежный
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+            osc.frequency.linearRampToValueAtTime(700, audioCtx.currentTime + 0.3);
+        } else if (mobType === 'fox') {
+            // 🦊 Лиса — низкий резкий, хищный
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+            osc.frequency.linearRampToValueAtTime(400, audioCtx.currentTime + 0.3);
+        } else {
+            // Дефолт
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+            osc.frequency.linearRampToValueAtTime(900, audioCtx.currentTime + 0.15);
+        }
+
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.3);
+    }
+
+    function playHitSound() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.2);
+    }
+
+    // === Плашки ===
+    let hitBanner = null;
+    function showHitBanner(damage) {
+        if (hitBanner) hitBanner.remove();
+        hitBanner = document.createElement('div');
+        hitBanner.style.cssText = `position:fixed;top:15%;left:50%;transform:translateX(-50%);background:rgba(180,0,0,0.85);backdrop-filter:blur(6px);color:white;font-weight:bold;font-size:22px;padding:10px 24px;border-radius:30px;box-shadow:0 0 25px rgba(255,0,0,0.7);border:2px solid rgba(255,255,255,0.4);z-index:10000;pointer-events:none;animation:fadeOut 1.5s ease forwards;`;
+        if (!CFG.showHitBanner) return;
+        hitBanner.textContent = `💥 Удар! -${Math.round(damage)} HP`;
+        document.body.appendChild(hitBanner);
+        setTimeout(() => { if (hitBanner) { hitBanner.remove(); hitBanner = null; } }, 1500);
+    }
+
+    let spawnBanner = null;
+    function showSpawnBanner(mobName) {
+        if (!getShowSpawnBanner()) return;
+        if (spawnBanner) spawnBanner.remove();
+        spawnBanner = document.createElement('div');
+        spawnBanner.style.cssText = `position:fixed;top:25%;left:50%;transform:translateX(-50%);background:rgba(255,140,0,0.9);backdrop-filter:blur(6px);color:white;font-weight:bold;font-size:20px;padding:8px 20px;border-radius:30px;box-shadow:0 0 20px rgba(255,140,0,0.7);border:2px solid rgba(255,255,255,0.5);z-index:10000;pointer-events:none;animation:fadeOut 2s ease forwards;`;
+        spawnBanner.textContent = `✨ Спавн: ${mobName}`;
+        document.body.appendChild(spawnBanner);
+        setTimeout(() => { if (spawnBanner) { spawnBanner.remove(); spawnBanner = null; } }, 2000);
+    }
+
+    // === Стили ===
+    if (!document.getElementById('cw-hud-styles')) {
+        const style = document.createElement('style');
+        style.id = 'cw-hud-styles';
+        style.textContent = `
+            @keyframes fadeOut { 0% { opacity:1;transform:translateX(-50%) scale(1); } 70% { opacity:1;transform:translateX(-50%) scale(1.05); } 100% { opacity:0;transform:translateX(-50%) scale(0.9); } }
+            .cw-hidden-button { display:none!important; }
+            .cw-cat-name {
+                opacity: 0.45;
+                transition: 0.15s ease;
+                filter: brightness(0.9);
+            }
+            .cw-cat-name:hover {
+                opacity: 1;
+                filter: brightness(1.2);
+            }
+            .cw-cat-name .clan {
+                opacity: 0.7;
+                font-size: 11px;
+                margin-left: 4px;
+                color: #ffd27a;
+            }
+            .cw-skills-panel {
+                position: fixed;
+                top: 60px;
+                left: 16px;
+                z-index: 9000;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                opacity: 0.25;
+                transition: opacity 0.2s ease;
+            }
+            .cw-skills-panel:hover { opacity: 1; }
+            .cw-skill-row {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                background: rgba(20, 20, 30, 0.55);
+                backdrop-filter: blur(12px);
+                border-radius: 20px;
+                padding: 5px 14px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+                border: 1px solid rgba(255,255,255,0.1);
+                min-width: 180px;
+                pointer-events: auto;
+            }
+            .cw-skill-icon { font-size: 16px; }
+            .cw-skill-info { display: flex; flex-direction: column; flex: 1; gap: 2px; }
+            .cw-skill-name { font-size: 11px; font-weight: 700; color: #f0f0f0; text-shadow: 0 1px 3px black; white-space: nowrap; }
+            .cw-skill-bar-wrap { height: 6px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; }
+            .cw-skill-bar { height: 100%; border-radius: 4px; transition: width 0.4s ease; }
+            .cw-skill-exp { font-size: 10px; color: rgba(255,255,255,0.6); text-shadow: 0 1px 2px black; white-space: nowrap; }
+
+            /* ===== Меню настроек ===== */
+            .cw-gear-btn {
+                position: fixed;
+                top: 16px;
+                left: 16px;
+                z-index: 9999;
+                width: 34px;
+                height: 34px;
+                background: rgba(20,20,30,0.55);
+                backdrop-filter: blur(12px);
+                border-radius: 50%;
+                border: 1px solid rgba(255,255,255,0.1);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                opacity: 0.25;
+                transition: opacity 0.2s ease, transform 0.3s ease;
+                font-size: 16px;
+                color: white;
+                user-select: none;
+            }
+            .cw-gear-btn:hover { opacity: 1; transform: rotate(45deg); }
+
+            .cw-settings-overlay {
+                display: none;
+                position: fixed;
+                inset: 0;
+                z-index: 10001;
+                background: rgba(0,0,0,0.5);
+                backdrop-filter: blur(4px);
+                align-items: center;
+                justify-content: center;
+            }
+            .cw-settings-overlay.open { display: flex; }
+
+            .cw-settings-modal {
+                background: rgba(15,15,25,0.92);
+                backdrop-filter: blur(20px);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.15);
+                box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+                padding: 24px 28px;
+                min-width: 420px;
+                max-width: 520px;
+                max-height: 80vh;
+                overflow-y: auto;
+                color: white;
+                font-family: inherit;
+            }
+            .cw-settings-modal h2 {
+                margin: 0 0 18px 0;
+                font-size: 17px;
+                font-weight: 700;
+                color: #f0f0f0;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .cw-settings-modal h3 {
+                margin: 16px 0 8px 0;
+                font-size: 12px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: rgba(255,255,255,0.4);
+            }
+            .cw-setting-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 7px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                font-size: 13px;
+                gap: 12px;
+            }
+            .cw-setting-row label { cursor: pointer; flex: 1; }
+            .cw-toggle {
+                position: relative;
+                display: inline-block;
+                width: 44px;
+                height: 24px;
+                flex-shrink: 0;
+                flex-grow: 0;
+            }
+            .cw-toggle input {
+                position: absolute;
+                opacity: 0;
+                width: 0;
+                height: 0;
+                margin: 0;
+                pointer-events: none;
+            }
+            .cw-toggle-slider {
+                position: absolute;
+                top: 0; left: 0;
+                width: 44px;
+                height: 24px;
+                background: rgba(255,255,255,0.15);
+                border-radius: 24px;
+                transition: background 0.2s;
+                cursor: pointer;
+                box-sizing: border-box;
+            }
+            .cw-toggle-slider:before {
+                content: '';
+                position: absolute;
+                width: 18px;
+                height: 18px;
+                left: 3px;
+                top: 3px;
+                background: white;
+                border-radius: 50%;
+                transition: transform 0.2s;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            }
+            .cw-toggle input:checked + .cw-toggle-slider { background: #5c6bc0; }
+            .cw-toggle input:checked + .cw-toggle-slider:before { transform: translateX(20px); }
+
+            .cw-color-row {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 7px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                font-size: 13px;
+            }
+            .cw-color-row label { flex: 1; }
+            .cw-color-row input[type=color] {
+                width: 36px;
+                height: 24px;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                background: none;
+                padding: 0;
+            }
+            .cw-url-row {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding: 7px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                font-size: 13px;
+            }
+            .cw-url-row .cw-url-top { display: flex; align-items: center; gap: 8px; }
+            .cw-url-row label { flex: 1; }
+            .cw-url-row input[type=text] {
+                width: 100%;
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 8px;
+                padding: 5px 10px;
+                color: white;
+                font-size: 11px;
+                outline: none;
+                margin-top: 4px;
+                box-sizing: border-box;
+            }
+            .cw-url-row input[type=text]::placeholder { color: rgba(255,255,255,0.3); }
+            .cw-test-btn {
+                background: rgba(92,107,192,0.3);
+                border: 1px solid rgba(92,107,192,0.5);
+                border-radius: 8px;
+                color: white;
+                font-size: 11px;
+                padding: 3px 8px;
+                cursor: pointer;
+                white-space: nowrap;
+                flex-shrink: 0;
+            }
+            .cw-test-btn:hover { background: rgba(92,107,192,0.6); }
+            .cw-settings-close {
+                margin-top: 20px;
+                width: 100%;
+                background: rgba(92,107,192,0.4);
+                border: 1px solid rgba(92,107,192,0.6);
+                border-radius: 12px;
+                color: white;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 9px;
+                cursor: pointer;
+                transition: background 0.2s;
+            }
+            .cw-settings-close:hover { background: rgba(92,107,192,0.7); }
+        `;
+        document.head.appendChild(style);
+    }
+
+    function log(...args) { console.log('%c[CWG HUD] — Lynx', 'color: #9c27b0; font-weight: bold', ...args); }
+
+    // === Навыки ===
+    const FIGHT_THRESHOLDS = [4, 16, 58, 112, 208, 358, 604, 1000];
+    const MED_THRESHOLDS   = [30, 90, 170, 270, 390, 520, 660, 810];
+
+    function getSkillInfo(exp, thresholds) {
+        let level = 1;
+        let prevThreshold = 0;
+        for (let i = 0; i < thresholds.length; i++) {
+            if (exp < thresholds[i]) {
+                level = i + 1;
+                const curExp = Math.floor(exp - prevThreshold);
+                const maxExp = thresholds[i] - prevThreshold;
+                return { level, curExp, maxExp };
+            }
+            prevThreshold = thresholds[i];
+        }
+        return { level: thresholds.length + 1, curExp: Math.floor(exp - prevThreshold), maxExp: null };
+    }
+
+    let skillsPanel = null;
+    let skillFightBar = null, skillFightExp = null, skillFightName = null;
+    let skillMedBar = null, skillMedExp = null, skillMedName = null;
+
+    function initSkillsPanel() {
+        if (skillsPanel) return;
+        skillsPanel = document.createElement('div');
+        skillsPanel.className = 'cw-skills-panel';
+
+        function makeRow(icon, nameText, color) {
+            const row = document.createElement('div');
+            row.className = 'cw-skill-row';
+
+            const iconEl = document.createElement('span');
+            iconEl.className = 'cw-skill-icon';
+            iconEl.textContent = icon;
+            row.appendChild(iconEl);
+
+            const info = document.createElement('div');
+            info.className = 'cw-skill-info';
+
+            const name = document.createElement('div');
+            name.className = 'cw-skill-name';
+            name.textContent = nameText;
+            info.appendChild(name);
+
+            const barWrap = document.createElement('div');
+            barWrap.className = 'cw-skill-bar-wrap';
+            const bar = document.createElement('div');
+            bar.className = 'cw-skill-bar';
+            bar.style.background = color;
+            bar.style.width = '0%';
+            barWrap.appendChild(bar);
+            info.appendChild(barWrap);
+
+            const expEl = document.createElement('div');
+            expEl.className = 'cw-skill-exp';
+            expEl.textContent = '...';
+            info.appendChild(expEl);
+
+            row.appendChild(info);
+            return { row, name, bar, exp: expEl };
+        }
+
+        const fight = makeRow('⚔️', 'Боевое ур.?', 'linear-gradient(90deg,#c62828,#ef5350)');
+        skillFightName = fight.name;
+        skillFightBar  = fight.bar;
+        skillFightExp  = fight.exp;
+        skillsPanel.appendChild(fight.row);
+
+        const med = makeRow('🌿', 'Целительство ур.?', 'linear-gradient(90deg,#2e7d32,#66bb6a)');
+        skillMedName = med.name;
+        skillMedBar  = med.bar;
+        skillMedExp  = med.exp;
+        skillsPanel.appendChild(med.row);
+
+        document.body.appendChild(skillsPanel);
+    }
+
+    function updateSkillsPanel() {
+        if (!skillsPanel) initSkillsPanel();
+        const me = window.CWGPlayground?.me?.();
+        if (!me) return;
+
+        const fightRaw = me.fightLevel?.exp ?? 0;
+        const medRaw   = me.medicineSkill?.exp ?? 0;
+
+        const f = getSkillInfo(fightRaw, FIGHT_THRESHOLDS);
+        const m = getSkillInfo(medRaw, MED_THRESHOLDS);
+
+        skillFightName.textContent = `Боевое ур.${f.level}`;
+        if (f.maxExp !== null) {
+            skillFightBar.style.width = `${Math.min(100, (f.curExp / f.maxExp) * 100)}%`;
+            skillFightExp.textContent = `${f.curExp} / ${f.maxExp}`;
+        } else {
+            skillFightBar.style.width = '100%';
+            skillFightExp.textContent = 'Макс.';
+        }
+
+        skillMedName.textContent = `Целительство ур.${m.level}`;
+        if (m.maxExp !== null) {
+            skillMedBar.style.width = `${Math.min(100, (m.curExp / m.maxExp) * 100)}%`;
+            skillMedExp.textContent = `${m.curExp} / ${m.maxExp}`;
+        } else {
+            skillMedBar.style.width = '100%';
+            skillMedExp.textContent = 'Макс.';
+        }
+    }
+
+    // === Обработка WS ===
+    function handlePayload(payload) {
+        const now = Date.now();
+        const entities = payload.entities;
+        if (!entities || !Array.isArray(entities)) return;
+
+        entities.forEach(entity => {
+            if (!entity || !entity.type) return;
+
+            if (MOB_TYPES[entity.type]) {
+                const key = `${entity.type}_${entity.position?.[0]}_${entity.position?.[1]}`;
+                const last = recentAlerts.get(key) || 0;
+                if (now - last > 5000) {
+                    recentAlerts.set(key, now);
+                    playSpawnSound(entity.type);
+                    showSpawnBanner(MOB_TYPES[entity.type]);
+                }
+            }
+        });
+    }
+
+    function handleNewEntities(data) {
+        let entities = data.payload || data.entities || data.data || (Array.isArray(data) ? data : null);
+        if (!entities || !Array.isArray(entities)) return;
+        const now = Date.now();
+        entities.forEach(entity => {
+            const type = entity.type;
+            if (!type || !MOB_TYPES[type]) return;
+            const key = entity.id || `${type}_${entity.position?.[0]}_${entity.position?.[1]}`;
+            const last = recentAlerts.get(key) || 0;
+            if (now - last > 5000) {
+                recentAlerts.set(key, now);
+                playSpawnSound(type);
+                showSpawnBanner(MOB_TYPES[type]);
+            }
+        });
+    }
+
+    // === Оверлеи ===
+    const activeOverlays = new Map();
+
+    let _cachedCanvas = null;
+    let _cachedRect = null;
+    let _rectLastUpdate = 0;
+
+    function getCachedCanvasRect() {
+        if (!_cachedCanvas) _cachedCanvas = document.querySelector('#root > canvas');
+        if (!_cachedCanvas) return null;
+        const now = Date.now();
+        if (now - _rectLastUpdate > 500) {
+            _cachedRect = _cachedCanvas.getBoundingClientRect();
+            _rectLastUpdate = now;
+        }
+        return _cachedRect;
+    }
+
+    function getSpritePosition(sprite) {
+        const rect = getCachedCanvasRect();
+        if (!rect || !sprite) return null;
+        const scaleX = rect.width / (_cachedCanvas.clientWidth || _cachedCanvas.width);
+        const scaleY = rect.height / (_cachedCanvas.clientHeight || _cachedCanvas.height);
+        let gp = { x: 0, y: 0 };
+        if (typeof sprite.getGlobalPosition === 'function') {
+            gp = sprite.getGlobalPosition();
+        } else if (sprite.worldTransform) {
+            gp.x = sprite.worldTransform.tx;
+            gp.y = sprite.worldTransform.ty;
+        }
+        return {
+            x: rect.left + gp.x * scaleX,
+            y: rect.top + gp.y * scaleY
+        };
+    }
+
+    function getSpriteCenterFromBounds(sprite) {
+        const rect = getCachedCanvasRect();
+        if (!rect || !sprite) return null;
+        const scaleX = rect.width / (_cachedCanvas.clientWidth || _cachedCanvas.width);
+        const scaleY = rect.height / (_cachedCanvas.clientHeight || _cachedCanvas.height);
+        const bounds = sprite.getBounds?.();
+        if (!bounds) return null;
+        return {
+            x: rect.left + ((bounds.minX + bounds.maxX) / 2) * scaleX,
+            y: rect.top + ((bounds.minY + bounds.maxY) / 2) * scaleY,
+        };
+    }
+
+    let catUidToDataCache = new Map();
+    let _catsLastUpdate = 0;
+
+    function refreshCatsCache() {
+        const me = window.CWGPlayground?.me?.();
+        const cats = window.CWGPlayground?.getCats?.() || [];
+        catUidToDataCache.clear();
+        cats.forEach(cat => {
+            if (cat.id === me?.id) return;
+            const uid = cat.view?.root?.uid;
+            if (uid !== undefined) {
+                catUidToDataCache.set(uid, {
+                    name: cat.name || '',
+                    clanName: cat.clanName || cat.clan?.tag || ''
+                });
+            }
+        });
+    }
+
+    function isChatOpen() {
+        const chat = document.querySelector('.MuiDrawer-paperAnchorDockedBottom');
+        return chat && chat.offsetParent !== null;
+    }
+
+    function updateOverlays() {
+        const root = window.CWGPlayground?.me?.()?.view?.root?.parent;
+        if (!root || !root.children) return;
+
+        const chatOpen = isChatOpen();
+        const usedUIDs = new Set();
+
+        for (const sprite of root.children) {
+            const uid = sprite.uid;
+            if (!uid) continue;
+
+            const isCat = getShowCatNames() && catUidToDataCache.has(uid);
+            const isMob = !isCat && MOB_LABELS.has(sprite.label);
+
+            if (!isMob && !isCat) continue;
+
+            usedUIDs.add(uid);
+
+            if (isMob && getHighlightMobs()) {
+                let overlay = activeOverlays.get(uid);
+                if (!overlay || !overlay.classList.contains('cw-mob-glow')) {
+                    if (overlay) overlay.remove();
+                    overlay = document.createElement('div');
+                    overlay.className = 'cw-mob-glow';
+                    overlay.style.cssText = `
+                        position: fixed;
+                        pointer-events: none;
+                        z-index: 100;
+                        width: 60px;
+                        height: 60px;
+                        background: radial-gradient(ellipse at center, transparent 20%, rgba(255,220,80,0.7) 50%, rgba(255,120,0,0.4) 70%, transparent 100%); 
+                        border-radius: 50%;
+                        transform: translate(-50%, -50%);
+                        filter: blur(3px);
+                        mix-blend-mode: screen;
+                    `;
+                    document.body.appendChild(overlay);
+                    activeOverlays.set(uid, overlay);
+                }
+                const mobType = Object.entries(MOB_TYPES).find(([,v]) => v.includes(sprite.label?.slice(2)))?.[0];
+                const mobColor = (mobType && CFG.mobColors[mobType]) || '#ffdc50';
+                const r = parseInt(mobColor.slice(1,3),16);
+                const g = parseInt(mobColor.slice(3,5),16);
+                const b = parseInt(mobColor.slice(5,7),16);
+                overlay.style.background = `radial-gradient(ellipse at center, transparent 20%, rgba(${r},${g},${b},0.7) 50%, rgba(${Math.round(r*0.5)},${Math.round(g*0.5)},${Math.round(b*0.5)},0.4) 70%, transparent 100%)`;
+
+                const center = getSpriteCenterFromBounds(sprite);
+                if (center) {
+                    overlay.style.left = center.x + 'px';
+                    overlay.style.top = center.y + 'px';
+                }
+
+            } else if (isCat) {
+                // Скрываем имена когда открыт чат
+                if (chatOpen) {
+                    const existing = activeOverlays.get(uid);
+                    if (existing) existing.style.visibility = 'hidden';
+                    usedUIDs.add(uid);
+                    continue;
+                }
+                const playerData = catUidToDataCache.get(uid);
+                let overlay = activeOverlays.get(uid);
+
+                if (!overlay || !overlay.classList.contains('cw-cat-name')) {
+                    if (overlay) overlay.remove();
+                    overlay = document.createElement('div');
+                    overlay.className = 'cw-cat-name';
+                    overlay.innerHTML = playerData.clanName
+                        ? `${playerData.name} <span class="clan">[${playerData.clanName}]</span>`
+                        : playerData.name;
+                    overlay.style.cssText = `
+                        position: fixed;
+                        pointer-events: none;
+                        z-index: 50;
+                        background: rgba(20, 20, 30, 0.75);
+                        backdrop-filter: blur(8px);
+                        border-radius: 12px;
+                        padding: 4px 10px;
+                        color: white;
+                        font-weight: bold;
+                        font-size: 13px;
+                        text-shadow: 0 2px 4px black;
+                        border: 1px solid rgba(255,255,255,0.2);
+                        transform: translate(-50%, -80%);
+                        white-space: nowrap;
+                    `;
+                    document.body.appendChild(overlay);
+                    activeOverlays.set(uid, overlay);
+                }
+
+                const pos = getSpritePosition(sprite);
+                if (pos) {
+                    overlay.style.visibility = 'visible';
+                    overlay.style.left = pos.x + 'px';
+                    overlay.style.top = (pos.y - 55) + 'px';
+                }
+            }
+        }
+
+        for (const [uid, overlay] of activeOverlays) {
+            if (!usedUIDs.has(uid)) {
+                overlay.remove();
+                activeOverlays.delete(uid);
+            }
+        }
+    }
+
+    // === HUD ===
+    let timeElement, stickerElement, hpContainer, hpFill, hpLabel;
+    let cdContainer, cdFill, cdLabel;
+    let lastHp = null;
+
+    const CD_DURATION = 2000; // мс — длительность КД удара
+    let cdStartTime = null;   // когда последний раз ударили
+
+    function getSticker(hour) {
+        if (hour >= 6 && hour < 12) return '🌅';
+        if (hour >= 12 && hour < 18) return '☀️';
+        if (hour >= 18 && hour < 24) return '🌆';
+        return '🌙';
+    }
+
+    function getGameTimeObject() {
+        const date = window.CWGPlayground?.getDate?.() || window.CWGPlayground?.getVirtualTime?.();
+        if (date && Array.isArray(date) && date.length >= 5) return { hour: Number(date[3]), min: Number(date[4]), valid: true };
+        if (date instanceof Date && !isNaN(date)) return { hour: date.getHours(), min: date.getMinutes(), valid: true };
+        if (typeof date === 'string' && /^\d{1,2}:\d{2}$/.test(date.trim())) {
+            const [h,m] = date.trim().split(':').map(Number);
+            return { hour: h, min: m, valid: true };
+        }
+        if (typeof date === 'object' && date.hour !== undefined && date.minute !== undefined) {
+            return { hour: Number(date.hour), min: Number(date.minute), valid: true };
+        }
+        return { hour: 0, min: 0, valid: false };
+    }
+
+    function initHUD() {
+        const target = document.querySelector('.MuiStack-root.css-1byqyzy');
+        if (!target) return false;
+
+        if (!timeElement) {
+            const wrapper = document.createElement('div');
+            wrapper.style.cssText = `display:flex;align-items:center;gap:6px;background:rgba(20,20,30,0.55);backdrop-filter:blur(12px);border-radius:20px;padding:5px 16px;margin-left:8px;box-shadow:0 4px 12px rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.1);`;
+            stickerElement = document.createElement('span');
+            stickerElement.style.fontSize = '20px';
+            wrapper.appendChild(stickerElement);
+            timeElement = document.createElement('span');
+            timeElement.style.cssText = 'font-weight:700;font-size:17px;color:#f0f0f0;text-shadow:0 2px 4px #000;';
+            wrapper.appendChild(timeElement);
+            target.appendChild(wrapper);
+        }
+
+        if (!hpContainer) {
+            hpContainer = document.createElement('div');
+            hpContainer.style.cssText = `display:flex;align-items:center;gap:8px;background:rgba(20,20,30,0.55);backdrop-filter:blur(12px);border-radius:20px;padding:5px 16px;margin-left:8px;box-shadow:0 4px 12px rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.1);min-width:160px;`;
+            const heart = document.createElement('span');
+            heart.textContent = '❤️'; heart.style.fontSize = '18px';
+            hpContainer.appendChild(heart);
+            const barC = document.createElement('div');
+            barC.style.cssText = 'flex:1;height:18px;background:rgba(255,255,255,0.1);border-radius:10px;overflow:hidden;position:relative;';
+            hpFill = document.createElement('div');
+            hpFill.style.cssText = 'height:100%;width:100%;transition:0.3s;border-radius:10px;';
+            barC.appendChild(hpFill);
+            hpLabel = document.createElement('div');
+            hpLabel.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:white;text-shadow:0 0 4px black;z-index:2;';
+            barC.appendChild(hpLabel);
+            hpContainer.appendChild(barC);
+            target.appendChild(hpContainer);
+        }
+
+        if (!cdContainer) {
+            cdContainer = document.createElement('div');
+            cdContainer.style.cssText = `display:flex;align-items:center;gap:8px;background:rgba(20,20,30,0.55);backdrop-filter:blur(12px);border-radius:20px;padding:5px 16px;margin-left:8px;box-shadow:0 4px 12px rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.1);min-width:130px;`;
+            const icon = document.createElement('span');
+            icon.textContent = '⚡'; icon.style.fontSize = '18px';
+            cdContainer.appendChild(icon);
+            const barC = document.createElement('div');
+            barC.style.cssText = 'flex:1;height:18px;background:rgba(255,255,255,0.1);border-radius:10px;overflow:hidden;position:relative;';
+            cdFill = document.createElement('div');
+            cdFill.style.cssText = 'height:100%;width:100%;border-radius:10px;background:linear-gradient(90deg,#5c6bc0,#42a5f5);transition:none;';
+            barC.appendChild(cdFill);
+            cdLabel = document.createElement('div');
+            cdLabel.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:white;text-shadow:0 0 4px black;z-index:2;';
+            cdLabel.textContent = 'Готово';
+            barC.appendChild(cdLabel);
+            cdContainer.appendChild(barC);
+            target.appendChild(cdContainer);
+        }
+
+        return true;
+    }
+
+    function updateHUD() {
+        if (timeElement && stickerElement) {
+            const t = getGameTimeObject();
+            if (t.valid) {
+                timeElement.textContent = `${String(t.hour).padStart(2,'0')}:${String(t.min).padStart(2,'0')}`;
+                stickerElement.textContent = getSticker(t.hour);
+            } else {
+                timeElement.textContent = '??:??';
+                stickerElement.textContent = '❓';
+            }
+        }
+        if (hpFill && hpLabel) {
+            const cat = window.CWGPlayground?.me?.();
+            if (cat) {
+                let hp = cat.hp?.value ?? cat.hp;
+                hp = Number(hp);
+                let maxHp = cat.maxHp || cat.hp?.max || 2000;
+                maxHp = Number(maxHp);
+                if (!isNaN(hp) && maxHp > 0) {
+                    const pct = (hp / maxHp) * 100;
+                    hpFill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+                    hpFill.style.background = pct > 65
+                        ? 'linear-gradient(90deg,#43a047,#66bb6a)'
+                        : pct > 40
+                            ? 'linear-gradient(90deg,#ef6c00,#ffa726)'
+                            : 'linear-gradient(90deg,#c62828,#ef5350)';
+                    hpLabel.textContent = `${Math.round(hp)}/${Math.round(maxHp)}`;
+                    if (lastHp !== null) {
+                        const delta = lastHp - hp;
+                        if (delta > 10) {
+                            playHitSound();
+                            showHitBanner(delta);
+                            cdStartTime = Date.now(); // сбрасываем КД при ударе
+                        }
+                    }
+                    lastHp = hp;
+                } else {
+                    hpLabel.textContent = '?/?';
+                    lastHp = null;
+                }
+            } else {
+                hpLabel.textContent = '?/?';
+                lastHp = null;
+            }
+        }
+        // ========== КД удара ==========
+        if (cdFill && cdLabel) {
+            if (cdStartTime === null) {
+                // Ещё не было удара — полная шкала
+                cdFill.style.width = '100%';
+                cdFill.style.background = 'linear-gradient(90deg,#5c6bc0,#42a5f5)';
+                cdLabel.textContent = 'Готово';
+            } else {
+                const elapsed = Date.now() - cdStartTime;
+                const pct = Math.min(1, elapsed / CD_DURATION);
+                cdFill.style.width = `${pct * 100}%`;
+                if (pct >= 1) {
+                    cdFill.style.background = 'linear-gradient(90deg,#5c6bc0,#42a5f5)';
+                    cdLabel.textContent = 'Готово';
+                } else {
+                    cdFill.style.background = 'linear-gradient(90deg,#b71c1c,#ef5350)';
+                    cdLabel.textContent = `${((CD_DURATION - elapsed) / 1000).toFixed(1)}s`;
+                }
+            }
+        }
+    }
+
+    function hideButtons() {
+        BUTTON_SELECTORS.forEach(sel => document.querySelectorAll(sel).forEach(btn => btn.classList.add('cw-hidden-button')));
+    }
+    setInterval(hideButtons, 500);
+
+    // === Меню ===
+    let settingsOverlay = null;
+
+    function buildSettingsMenu() {
+        if (settingsOverlay) { settingsOverlay.classList.toggle('open'); return; }
+
+        settingsOverlay = document.createElement('div');
+        settingsOverlay.className = 'cw-settings-overlay open';
+        settingsOverlay.addEventListener('click', e => { if (e.target === settingsOverlay) settingsOverlay.classList.remove('open'); });
+
+        const modal = document.createElement('div');
+        modal.className = 'cw-settings-modal';
+
+        modal.innerHTML = `<h2>⚙️ Настройки мода</h2>`;
+
+        function makeToggle(labelText, cfgKey) {
+            const row = document.createElement('div');
+            row.className = 'cw-setting-row';
+            const lbl = document.createElement('label');
+            lbl.textContent = labelText;
+            const tog = document.createElement('label');
+            tog.className = 'cw-toggle';
+            const inp = document.createElement('input');
+            inp.type = 'checkbox';
+            inp.checked = CFG[cfgKey];
+            inp.addEventListener('change', () => { CFG[cfgKey] = inp.checked; saveSettings(); applySettings(); });
+            const slider = document.createElement('span');
+            slider.className = 'cw-toggle-slider';
+            tog.appendChild(inp); tog.appendChild(slider);
+            row.appendChild(lbl); row.appendChild(tog);
+            return row;
+        }
+
+        function makeColorRow(labelText, mobKey) {
+            const row = document.createElement('div');
+            row.className = 'cw-color-row';
+            const lbl = document.createElement('label');
+            lbl.textContent = labelText;
+            const inp = document.createElement('input');
+            inp.type = 'color';
+            inp.value = CFG.mobColors[mobKey];
+            inp.addEventListener('input', () => { CFG.mobColors[mobKey] = inp.value; saveSettings(); });
+            row.appendChild(lbl); row.appendChild(inp);
+            return row;
+        }
+
+        function makeUrlRow(labelText, mobKey) {
+            const row = document.createElement('div');
+            row.className = 'cw-url-row';
+            const top = document.createElement('div');
+            top.className = 'cw-url-top';
+            const lbl = document.createElement('label');
+            lbl.textContent = labelText;
+            const testBtn = document.createElement('button');
+            testBtn.className = 'cw-test-btn';
+            testBtn.textContent = '▶ Тест';
+            top.appendChild(lbl); top.appendChild(testBtn);
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.placeholder = 'URL на mp3/ogg (оставь пустым для дефолта)';
+            inp.value = CFG.mobSoundUrls[mobKey] || '';
+            inp.addEventListener('change', () => { CFG.mobSoundUrls[mobKey] = inp.value.trim(); saveSettings(); });
+            testBtn.addEventListener('click', () => {
+                const url = inp.value.trim();
+                if (url) { const a = new Audio(url); a.volume = 0.3; a.play().catch(()=>{}); }
+                else playSpawnSound(mobKey);
+            });
+            row.appendChild(top); row.appendChild(inp);
+            return row;
+        }
+
+        // Секция: интерфейс
+        const h1 = document.createElement('h3'); h1.textContent = 'Интерфейс';
+        modal.appendChild(h1);
+        modal.appendChild(makeToggle('Имена игроков над головой', 'showCatNames'));
+        modal.appendChild(makeToggle('Шкала КД удара', 'showCdBar'));
+        modal.appendChild(makeToggle('Плашка навыков', 'showSkillsPanel'));
+        modal.appendChild(makeToggle('Баннер удара (💥)', 'showHitBanner'));
+        modal.appendChild(makeToggle('Часы игрового времени', 'showClock'));
+        modal.appendChild(makeToggle('Полоска HP', 'showHpBar'));
+
+        // Секция: мобы
+        const h2 = document.createElement('h3'); h2.textContent = 'Мобы';
+        modal.appendChild(h2);
+        modal.appendChild(makeToggle('Подсветка мобов (ореол)', 'highlightMobs'));
+        modal.appendChild(makeToggle('Звук на спавн', 'playSpawnSound'));
+        modal.appendChild(makeToggle('Баннер спавна (✨)', 'showSpawnBanner'));
+
+        // Секция: цвета ореолов
+        const h3 = document.createElement('h3'); h3.textContent = 'Цвет ореола';
+        modal.appendChild(h3);
+        modal.appendChild(makeColorRow('🐭 Мышь', 'mouse'));
+        modal.appendChild(makeColorRow('🦋 Бабочка', 'butterfly'));
+        modal.appendChild(makeColorRow('🦊 Лиса', 'fox'));
+
+        // Секция: звуки
+        const h4 = document.createElement('h3'); h4.textContent = 'Свой звук на спавн (URL mp3/ogg)';
+        modal.appendChild(h4);
+        modal.appendChild(makeUrlRow('🐭 Мышь', 'mouse'));
+        modal.appendChild(makeUrlRow('🦋 Бабочка', 'butterfly'));
+        modal.appendChild(makeUrlRow('🦊 Лиса', 'fox'));
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'cw-settings-close';
+        closeBtn.textContent = 'Закрыть';
+        closeBtn.addEventListener('click', () => settingsOverlay.classList.remove('open'));
+        modal.appendChild(closeBtn);
+
+        settingsOverlay.appendChild(modal);
+        document.body.appendChild(settingsOverlay);
+    }
+
+    function applySettings() {
+        if (skillsPanel) skillsPanel.style.display = CFG.showSkillsPanel ? 'flex' : 'none';
+        if (cdContainer) cdContainer.style.display = CFG.showCdBar ? 'flex' : 'none';
+        if (hpContainer) hpContainer.style.display = CFG.showHpBar ? 'flex' : 'none';
+        // Часы — wrapper это следующий элемент после hpContainer, ищем по timeElement
+        if (timeElement) timeElement.parentElement.style.display = CFG.showClock ? 'flex' : 'none';
+    }
+
+    function initGearButton() {
+        if (document.getElementById('cw-gear-btn')) return;
+        const btn = document.createElement('div');
+        btn.id = 'cw-gear-btn';
+        btn.className = 'cw-gear-btn';
+        btn.textContent = '⚙️';
+        btn.title = 'Настройки мода';
+        btn.addEventListener('click', buildSettingsMenu);
+        document.body.appendChild(btn);
+    }
+
+    function start() {
+        log('🌟 Lynx v3.0 by Gwenary');
+        setInterval(() => { if (initHUD()) updateHUD(); }, 300);
+        setInterval(updateHUD, 150);
+        setInterval(refreshCatsCache, 1000);
+        setInterval(updateOverlays, 100);   
+        setInterval(updateSkillsPanel, 1000);
+        hideButtons();
+        refreshCatsCache();
+        initGearButton();
+        applySettings();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+})();
